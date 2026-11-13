@@ -14,7 +14,7 @@ def test_valid_annotation_created():
         is_gold=False,
         label="positive",
         confidence=0.85,
-        duration_in_seconds=12.5,
+        duration_sec=12.5,
         annotated_at=datetime(2023, 10, 1, 12, 0, 0),
         batch_id="batch_1",
     )
@@ -48,9 +48,7 @@ def test_confidence_outside_range_raises_error():
 def test_negative_duration_raises_error():
     """Each bad case raises ValueError: negative duration."""
     with pytest.raises(ValueError, match="Duration cannot be negative"):
-        Annotation(
-            item_id="1", annotator_id="A", is_gold=False, duration_in_seconds=-5.0
-        )
+        Annotation(item_id="1", annotator_id="A", is_gold=False, duration_sec=-5.0)
 
 
 def test_missing_gold_label_for_gold_item_raises_error():

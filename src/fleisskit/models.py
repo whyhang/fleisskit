@@ -10,7 +10,7 @@ class Annotation:
     is_gold: bool
     label: str | None = None
     confidence: float | None = None
-    duration_in_seconds: float | None = None
+    duration_sec: float | None = None
     annotated_at: datetime | None = None
     batch_id: str | None = None
     gold_label: str | None = None
@@ -34,10 +34,8 @@ class Annotation:
             )
 
         # Validate duration
-        if self.duration_in_seconds is not None and self.duration_in_seconds < 0:
-            raise ValueError(
-                f"Duration cannot be negative, got {self.duration_in_seconds}"
-            )
+        if self.duration_sec is not None and self.duration_sec < 0:
+            raise ValueError(f"Duration cannot be negative, got {self.duration_sec}")
 
         # Validate gold_label is present when the is_gold is True
         if self.is_gold and self.gold_label is None:
