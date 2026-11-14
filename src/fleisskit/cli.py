@@ -4,6 +4,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from fleisskit.fleiss import fleiss_kappa
 from fleisskit.io import DataValidationError, load_csv, load_json
 from fleisskit.metrics import majority_vote, percent_agreement
 
@@ -29,12 +30,20 @@ def run_report(file_path: Path, output_format: str) -> int:
         try:
             pa = percent_agreement(collection)
         except ValueError:
-            pa = None  # Handle only 1 reviewe per label
+            pa = None
 
         mv = majority_vote(collection)
         mv_counts = dict(Counter(mv.values()))
 
-        # results to stdout
+        # Calculate Fleiss' Kappa
+        fk_error = None
+        try:
+            fk = fleiss_kappa(collection)
+        except ValueError as e:
+            fk = None
+            fk_error = str(e)
+
+        # Output results to stdout
         if output_format == "json":
             output_data = {
                 "items": items_count,
@@ -42,12 +51,12 @@ def run_report(file_path: Path, output_format: str) -> int:
                 "labels_provided": labels_count,
                 "percent_agreement": pa,
                 "majority_vote_distribution": mv_counts,
-                "fleiss_kappa": None,  # sneak peek
+                "fleiss_kappa": fk,
             }
             print(json.dumps(output_data, indent=2))
         else:
             print(f"Report for {file_path.name}")
-            print("-" * (11 + len(file_path.name)))  # center aligner
+            print("-" * (11 + len(file_path.name)))
             print(f"Items: {items_count}")
             print(f"Annotators: {annotators_count}")
             print(f"Labels Provided: {labels_count}")
@@ -59,13 +68,16 @@ def run_report(file_path: Path, output_format: str) -> int:
 
             print("Majority Vote Distribution:")
             if mv_counts:
-                # consistency - alphabetical sort
                 for label, count in sorted(mv_counts.items()):
                     print(f"  - {label}: {count}")
             else:
                 print("  None")
 
-            print("Fleiss' Kappa: Not yet implemented")
+            # Print Fleiss' Kappa Output
+            if fk is not None:
+                print(f"Fleiss' Kappa: {fk:.4f}")
+            else:
+                print(f"Fleiss' Kappa: N/A ({fk_error})")
 
     except (DataValidationError, ValueError, TypeError) as e:
         # data problems exit with code 1

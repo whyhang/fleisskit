@@ -24,6 +24,7 @@ def test_cli_report_text(tmp_path, capsys):
     assert "Percent Agreement: 100.00%" in captured.out
     assert "- positive: 1" in captured.out
     assert "- negative: 1" in captured.out
+    assert "Fleiss' Kappa: N/A (Varying number of ratings per item." in captured.out
     assert captured.err == ""  # Stderr MUST be clean
 
 
