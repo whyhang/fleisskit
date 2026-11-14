@@ -114,15 +114,14 @@ def cohens_kappa(
 def majority_vote(collection: AnnotationCollection) -> dict[str, str]:
     """
     Calculates the majority vote label for each item.
-
     For each item, returns the label chosen by the most annotators.
-
     Tie-breaking rule:
     If there is a tie (e.g., label 'B' has 2 votes and label 'A' has 2 votes),
-    the function chooses the alphabetically first label (so it returns 'A').
+    the function chooses the alphabetically first label
+    Just having a deterministic tie-breaker
 
     Returns:
-        A dictionary mapping item_id to the chosen majority label.
+        A dictionaryitem_id => majority label.
     """
     # Group labels by item
     item_labels: dict[str, list[str]] = defaultdict(list)
@@ -139,10 +138,8 @@ def majority_vote(collection: AnnotationCollection) -> dict[str, str]:
         counts = Counter(labels)
         max_votes = max(counts.values())
 
-        # Gather all labels that got the maximum number of votes
+        # Edge case
         tied_labels = [label for label, count in counts.items() if count == max_votes]
-
-        # Sort alphabetically and pick the first one
         tied_labels.sort()
         results[item_id] = tied_labels[0]
 
