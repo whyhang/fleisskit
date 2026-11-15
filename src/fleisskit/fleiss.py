@@ -1,6 +1,38 @@
+import math
+import random
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 
 from fleisskit.models import AnnotationCollection
+
+
+@dataclass
+class ConfidenceInterval:
+    """
+    Represents a confidence interval for an estimate.
+    """
+
+    lower_bound: float
+    upper_bound: float
+    method: str
+    alpha: float
+    skipped_resamples: int = 0
+
+
+@dataclass
+class KappaResult:
+    """Holds a kappa estimate and its optional confidence interval."""
+
+    estimate: float
+    ci: ConfidenceInterval | None = None
+
+
+@dataclass
+class FleissReport:
+    """Comprehensive result object for overall and per-category Fleiss' kappa."""
+
+    overall_kappa: KappaResult
+    per_category_kappa: dict[str, KappaResult]
 
 
 def build_count_table(
@@ -144,3 +176,130 @@ def per_category_kappa(collection: AnnotationCollection) -> dict[str, float]:
     """
     table, labels = build_count_table(collection)
     return _per_category_kappa_components(table, labels)
+
+
+def _calculate_formula_ci(
+    table: list[list[int]], estimate: float, alpha: float
+) -> ConfidenceInterval:
+    """
+    Calculates the confidence interval using the analytical standard error formula.
+
+    WARNING: This uses the standard error derived by Fleiss (1971) assuming the true
+    kappa is strictly 0. It is meant for testing if agreement is better than chance,
+    not for building accurate intervals around non-zero estimates.
+    """
+    N = len(table)
+    k = len(table[0])
+    n = sum(table[0])
+
+    p_j = [sum(row[j] for row in table) / (N * n) for j in range(k)]
+    sum_pj2 = sum(p**2 for p in p_j)
+    sum_pj3 = sum(p**3 for p in p_j)
+
+    numerator = sum_pj2 - (2 * n - 3) * (sum_pj2**2) + 2 * (n - 2) * sum_pj3
+    denominator = N * n * (n - 1) * ((1.0 - sum_pj2) ** 2)
+    var_k0 = (2.0 / denominator) * numerator
+
+    se = math.sqrt(var_k0)
+    z = 1.95996 if math.isclose(alpha, 0.05) else 1.96
+
+    return ConfidenceInterval(
+        lower_bound=estimate - (z * se),
+        upper_bound=estimate + (z * se),
+        method="formula_se_k0",
+        alpha=alpha,
+    )
+
+
+def _calculate_bootstrap_ci(
+    table: list[list[int]], labels: list[str], repeats: int, seed: int, alpha: float
+) -> tuple[ConfidenceInterval | None, dict[str, ConfidenceInterval | None]]:
+    """
+    Calculates empirical confidence intervals using the bootstrap method.
+    Resamples whole items (rows) with replacement.
+    """
+    rng = random.Random(seed)
+    N = len(table)
+
+    overall_kappas = []
+    cat_kappas: dict[str, list[float]] = {lbl: [] for lbl in labels}
+
+    overall_skips = 0
+    cat_skips: dict[str, int] = {lbl: 0 for lbl in labels}
+
+    for _ in range(repeats):
+        resample = rng.choices(table, k=N)
+
+        try:
+            k_est, _, _ = _fleiss_kappa_components(resample)
+            overall_kappas.append(k_est)
+        except ValueError:
+            overall_skips += 1
+
+        c_ests = _per_category_kappa_components(resample, labels)
+        for lbl in labels:
+            if lbl in c_ests:
+                cat_kappas[lbl].append(c_ests[lbl])
+            else:
+                cat_skips[lbl] += 1
+
+    def get_ci(vals: list[float], skips: int) -> ConfidenceInterval | None:
+        if not vals:
+            return None
+        vals.sort()
+        lower_idx = int(len(vals) * (alpha / 2.0))
+        upper_idx = min(int(len(vals) * (1.0 - (alpha / 2.0))), len(vals) - 1)
+
+        return ConfidenceInterval(
+            lower_bound=vals[lower_idx],
+            upper_bound=vals[upper_idx],
+            method="bootstrap",
+            alpha=alpha,
+            skipped_resamples=skips,
+        )
+
+    overall_ci = get_ci(overall_kappas, overall_skips)
+    per_cat_cis = {lbl: get_ci(cat_kappas[lbl], cat_skips[lbl]) for lbl in labels}
+
+    return overall_ci, per_cat_cis
+
+
+def analyze_fleiss(
+    collection: AnnotationCollection,
+    calc_ci: bool = False,
+    ci_method: str = "bootstrap",
+    ci_repeats: int = 1000,
+    ci_seed: int = 42,
+    ci_alpha: float = 0.05,
+) -> FleissReport:
+    """
+    Calculates overall Fleiss' kappa and per-category kappas, optionally with
+    confidence intervals.
+    """
+    table, labels = build_count_table(collection)
+
+    overall_est, _, _ = _fleiss_kappa_components(table)
+    cat_ests = _per_category_kappa_components(table, labels)
+
+    overall_ci = None
+    cat_cis: dict[str, ConfidenceInterval | None] = {lbl: None for lbl in labels}
+
+    if calc_ci:
+        if ci_method == "bootstrap":
+            overall_ci, cat_cis = _calculate_bootstrap_ci(
+                table, labels, ci_repeats, ci_seed, ci_alpha
+            )
+        elif ci_method == "formula":
+            overall_ci = _calculate_formula_ci(table, overall_est, ci_alpha)
+        else:
+            raise ValueError(f"Unknown CI method: {ci_method}")
+
+    report = FleissReport(
+        overall_kappa=KappaResult(estimate=overall_est, ci=overall_ci),
+        per_category_kappa={},
+    )
+
+    for lbl, est in cat_ests.items():
+        report.per_category_kappa[lbl] = KappaResult(estimate=est, ci=cat_cis.get(lbl))
+
+    return report

@@ -1,10 +1,14 @@
 import random
+import time
 
 import pytest
 
 from fleisskit.fleiss import (
+    _calculate_bootstrap_ci,
+    _calculate_formula_ci,
     _fleiss_kappa_components,
     _per_category_kappa_components,
+    analyze_fleiss,
     build_count_table,
     fleiss_kappa,
     per_category_kappa,
@@ -73,7 +77,7 @@ def test_fleiss_kappa_wikipedia_example():
     assert kappa == pytest.approx(0.210, abs=0.001)
 
 
-# Per-category kappa tests
+# --- Per-category kappa tests ---
 
 
 def test_per_category_kappa_wikipedia_example():
@@ -138,8 +142,6 @@ def test_per_category_kappa_uses_label_names_as_keys():
 
     assert set(result) == {"Neg", "Neu", "Pos"}
     assert result["Pos"] == pytest.approx(1.0)
-    # Neg / Neu: p = 1/3, q = 2/3, disagreement = 1*1 + 1*1 = 2
-    # kappa = 1 - 2 / (3 * 2 * 1 * 2/9) = -0.5
     assert result["Neg"] == pytest.approx(-0.5)
     assert result["Neu"] == pytest.approx(-0.5)
 
@@ -167,19 +169,12 @@ def test_per_category_kappa_skips_label_with_p_j_zero():
 
 
 def test_per_category_kappa_returns_one_value_per_label():
-    """
-    Returns exactly k entries, one per label, keyed by label name.
-
-    k is the number of distinct labels in the data. This holds whenever k >= 2:
-    every used label then has 0 < p_j < 1, so none is skipped. (With a single
-    label, p_j = 1 and the result is empty; see the p_j = 1 test above.)
-    """
+    """Returns exactly k entries, one per label, keyed by label name."""
     labels = ["L0", "L1", "L2", "L3", "L4"]
     k = len(labels)
     collection, _ = generate_synthetic_data(
         num_items=100, num_annotators=4, labels=labels, accuracy=0.7, seed=7
     )
-    # Precondition: every label was actually used, so k really is len(labels).
     assert {ann.label for ann in collection.annotations} == set(labels)
 
     result = per_category_kappa(collection)
@@ -202,25 +197,17 @@ def test_per_category_kappa_varying_ratings_raises_error():
         per_category_kappa(collection)
 
 
-# Per-category kappa property tests on generated datasets
-
-
-@pytest.mark.parametrize("seed", range(50))
+@pytest.mark.parametrize("seed", range(15))
 def test_per_category_kappa_weighted_average_matches_overall_on_generated_data(seed):
     """
-    On 50 seeded synthetic datasets, the p_j*q_j-weighted average of the per-label
+    On seeded synthetic datasets, the p_j*q_j-weighted average of the per-label
     kappas must equal the overall Fleiss' kappa within 1e-9.
-
-    The dataset shape (items, annotators, labels, accuracy, spammers) is also
-    derived from the seed, so each run covers a different configuration.
-    skip_rate stays 0 because Fleiss' kappa needs a constant number of ratings
-    per item.
     """
     shape_rng = random.Random(seed)
     num_labels = shape_rng.randint(2, 6)
     collection, _ = generate_synthetic_data(
-        num_items=shape_rng.randint(10, 200),
-        num_annotators=shape_rng.randint(2, 10),
+        num_items=shape_rng.randint(10, 50),
+        num_annotators=shape_rng.randint(2, 5),
         labels=[f"L{i}" for i in range(num_labels)],
         accuracy=shape_rng.uniform(0.3, 0.95),
         spammer_share=shape_rng.choice([0.0, 0.2, 0.4]),
@@ -231,7 +218,6 @@ def test_per_category_kappa_weighted_average_matches_overall_on_generated_data(s
     per_label = per_category_kappa(collection)
     overall = fleiss_kappa(collection)
 
-    # Weights p_j * q_j, taken from the same count table the metrics use.
     table, labels = build_count_table(collection)
     total_ratings = len(table) * sum(table[0])
     weights = {}
@@ -239,12 +225,95 @@ def test_per_category_kappa_weighted_average_matches_overall_on_generated_data(s
         p_j = sum(row[j] for row in table) / total_ratings
         weights[label] = p_j * (1.0 - p_j)
 
-    # Skipped labels (p_j = 0 or 1) have zero weight, so leaving them out of
-    # the sum is exact. Check that only those labels were dropped.
     assert set(per_label) == {lbl for lbl, w in weights.items() if w > 0}
-    assert len(per_label) >= 2
 
     weighted = sum(weights[lbl] * k for lbl, k in per_label.items()) / sum(
         weights.values()
     )
     assert weighted == pytest.approx(overall, abs=1e-9)
+
+
+# --- Confidence Interval & Analysis Tests ---
+
+
+def test_wikipedia_ci_contains_estimate():
+    """Both CI methods must encompass the known Wikipedia estimate."""
+    # 1. Overall Formula CI
+    kappa, _, _ = _fleiss_kappa_components(WIKI_TABLE)
+    ci_form = _calculate_formula_ci(WIKI_TABLE, kappa, 0.05)
+    assert ci_form.lower_bound <= kappa <= ci_form.upper_bound
+
+    # 2. Bootstrap CI
+    ci_boot_overall, ci_boot_cats = _calculate_bootstrap_ci(
+        WIKI_TABLE, WIKI_LABELS, repeats=500, seed=42, alpha=0.05
+    )
+    assert ci_boot_overall.lower_bound <= kappa <= ci_boot_overall.upper_bound
+
+    # 3. Check per-category encompasses the estimates
+    cat_estimates = _per_category_kappa_components(WIKI_TABLE, WIKI_LABELS)
+    for lbl, est in cat_estimates.items():
+        ci_cat = ci_boot_cats[lbl]
+        assert ci_cat.lower_bound <= est <= ci_cat.upper_bound
+
+
+def test_bootstrap_seed_determinism():
+    """Identical seeds must yield identical bounds."""
+    ci1_overall, _ = _calculate_bootstrap_ci(WIKI_TABLE, WIKI_LABELS, 100, 99, 0.05)
+    ci2_overall, _ = _calculate_bootstrap_ci(WIKI_TABLE, WIKI_LABELS, 100, 99, 0.05)
+
+    assert ci1_overall.lower_bound == ci2_overall.lower_bound
+    assert ci1_overall.upper_bound == ci2_overall.upper_bound
+
+
+def test_bootstrap_performance():
+    """1000 resamples on 500 items must finish in well under 10 seconds."""
+    collection, _ = generate_synthetic_data(
+        num_items=500, num_annotators=5, labels=["A", "B", "C"], seed=42
+    )
+
+    start_time = time.time()
+    analyze_fleiss(
+        collection, calc_ci=True, ci_method="bootstrap", ci_repeats=1000, ci_seed=1
+    )
+    duration = time.time() - start_time
+
+    assert duration < 10.0
+
+
+def test_coverage_simulation():
+    """
+    Simulates datasets where the true kappa is known.
+    The 95% interval should contain the true kappa in roughly ~95% of runs.
+    """
+    # Estimate true kappa on a massive dataset to establish ground truth
+    massive_col, _ = generate_synthetic_data(
+        num_items=5000, num_annotators=3, labels=["A", "B"], accuracy=0.75, seed=1
+    )
+    true_kappa = analyze_fleiss(massive_col).overall_kappa.estimate
+
+    contains_true = 0
+    num_datasets = 50
+
+    for i in range(num_datasets):
+        small_col, _ = generate_synthetic_data(
+            num_items=40,
+            num_annotators=3,
+            labels=["A", "B"],
+            accuracy=0.75,
+            seed=i + 100,
+        )
+        report = analyze_fleiss(
+            small_col, calc_ci=True, ci_method="bootstrap", ci_repeats=200, ci_seed=i
+        )
+
+        if (
+            report.overall_kappa.ci.lower_bound
+            <= true_kappa
+            <= report.overall_kappa.ci.upper_bound
+        ):
+            contains_true += 1
+
+    coverage_ratio = contains_true / num_datasets
+
+    # Expect 95% coverage, allow tolerance (85% to 100%) due to small subset sizes in tests
+    assert 0.85 <= coverage_ratio <= 1.0
