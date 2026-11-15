@@ -1,4 +1,5 @@
 import csv
+import json
 import random
 from pathlib import Path
 from typing import TypedDict
@@ -20,6 +21,7 @@ def generate_synthetic_data(
     skip_rate: float = 0.0,
     seed: int = 42,
     output_csv: str | Path | None = None,
+    output_json: str | Path | None = None,
 ) -> tuple[AnnotationCollection, dict[str, str]]:
     """
     Generates realistic synthetic annotations
@@ -30,6 +32,9 @@ def generate_synthetic_data(
     - Spammers always pick the same label extremely fast (ignores accuracy).
     - Annotations are randomly dropped based on `skip_rate`.
     - ALL randomness is governed strictly by the provided seed.
+
+    Optionally writes the annotations to `output_csv` and/or `output_json`.
+    Both use the same fields and rounding, and load back with load_csv / load_json.
     """
     if len(labels) < 2:
         raise ValueError("Must provide at least 2 labels to generate meaningful data.")
@@ -134,5 +139,31 @@ def generate_synthetic_data(
                         ann.gold_label or "",
                     ]
                 )
+
+    # save to JSON [optional]: a list of objects with native JSON types
+    if output_json:
+        records = [
+            {
+                "item_id": ann.item_id,
+                "annotator_id": ann.annotator_id,
+                "is_gold": ann.is_gold,
+                "label": ann.label,
+                "confidence": (
+                    round(ann.confidence, 4) if ann.confidence is not None else None
+                ),
+                "duration_sec": (
+                    round(ann.duration_sec, 2) if ann.duration_sec is not None else None
+                ),
+                "annotated_at": (
+                    ann.annotated_at.isoformat() if ann.annotated_at else None
+                ),
+                "batch_id": ann.batch_id,
+                "gold_label": ann.gold_label,
+            }
+            for ann in collection.annotations
+        ]
+        with Path(output_json).open("w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2)
+            f.write("\n")
 
     return collection, true_labels

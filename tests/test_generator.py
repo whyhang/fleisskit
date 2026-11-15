@@ -1,9 +1,10 @@
 import csv
+import json
 
 import pytest
 
 from fleisskit.generator import generate_synthetic_data
-from fleisskit.io import load_csv
+from fleisskit.io import load_csv, load_json
 
 
 def test_generator_determinism():
@@ -111,5 +112,41 @@ def test_generator_csv_export_comprehensive(tmp_path):
         assert loaded.confidence == pytest.approx(orig.confidence, abs=1e-4)
         assert loaded.duration_sec == pytest.approx(orig.duration_sec, abs=1e-2)
 
+        assert loaded.batch_id is None
+        assert loaded.gold_label is None
+
+
+def test_generator_json_export_round_trip(tmp_path):
+    """JSON export uses native JSON types and loads back to the same annotations."""
+    json_file = tmp_path / "synthetic.json"
+
+    orig_col, _ = generate_synthetic_data(
+        num_items=5, num_annotators=2, labels=["A", "B"], output_json=json_file, seed=1
+    )
+
+    assert json_file.exists()
+
+    records = json.loads(json_file.read_text(encoding="utf-8"))
+    assert isinstance(records, list)
+    assert len(records) == 10  # 5 items * 2 annotators (0 skip rate)
+
+    first = records[0]
+    assert first["is_gold"] is False  # a real JSON boolean, not the string "false"
+    assert first["batch_id"] is None  # missing values are null, not ""
+    assert first["gold_label"] is None
+    assert isinstance(first["confidence"], float)
+    # Same rounding as the CSV export
+    assert first["confidence"] == round(first["confidence"], 4)
+    assert first["duration_sec"] == round(first["duration_sec"], 2)
+
+    loaded_col = load_json(json_file)
+    assert len(loaded_col.annotations) == len(orig_col.annotations)
+    for orig, loaded in zip(orig_col.annotations, loaded_col.annotations):
+        assert loaded.item_id == orig.item_id
+        assert loaded.annotator_id == orig.annotator_id
+        assert loaded.is_gold == orig.is_gold
+        assert loaded.label == orig.label
+        assert loaded.confidence == pytest.approx(orig.confidence, abs=1e-4)
+        assert loaded.duration_sec == pytest.approx(orig.duration_sec, abs=1e-2)
         assert loaded.batch_id is None
         assert loaded.gold_label is None
