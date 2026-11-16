@@ -50,6 +50,17 @@ def build_count_table(
     Raises ValueError if items have different numbers of ratings, as Fleiss'
     kappa requires a constant number of ratings per item.
     """
+    table, labels_list, _ = _build_count_table_with_items(collection)
+    return table, labels_list
+
+
+def _build_count_table_with_items(
+    collection: AnnotationCollection,
+) -> tuple[list[list[int]], list[str], list[str]]:
+    """
+    Same as build_count_table, but also returns the item_ids in row order, so
+    callers can line up per-annotator labels with table rows.
+    """
     item_labels: dict[str, list[str]] = defaultdict(list)
     unique_labels = set()
 
@@ -66,7 +77,8 @@ def build_count_table(
     expected_n = None
 
     # Sort keys for perfectly deterministic row ordering
-    for item_id in sorted(item_labels.keys()):
+    item_ids = sorted(item_labels.keys())
+    for item_id in item_ids:
         labels = item_labels[item_id]
         n_ratings = len(labels)
 
@@ -84,7 +96,7 @@ def build_count_table(
     if expected_n is not None and expected_n < 2:
         raise ValueError("Fleiss' kappa requires at least 2 ratings per item.")
 
-    return table, labels_list
+    return table, labels_list, item_ids
 
 
 def _fleiss_kappa_components(table: list[list[int]]) -> tuple[float, float, float]:
@@ -211,6 +223,25 @@ def _calculate_formula_ci(
     )
 
 
+def _percentile_ci(
+    vals: list[float], skips: int, alpha: float
+) -> ConfidenceInterval | None:
+    """Percentile bootstrap interval from resampled estimates (None if no values)."""
+    if not vals:
+        return None
+    vals = sorted(vals)
+    lower_idx = int(len(vals) * (alpha / 2.0))
+    upper_idx = min(int(len(vals) * (1.0 - (alpha / 2.0))), len(vals) - 1)
+
+    return ConfidenceInterval(
+        lower_bound=vals[lower_idx],
+        upper_bound=vals[upper_idx],
+        method="bootstrap",
+        alpha=alpha,
+        skipped_resamples=skips,
+    )
+
+
 def _calculate_bootstrap_ci(
     table: list[list[int]], labels: list[str], repeats: int, seed: int, alpha: float
 ) -> tuple[ConfidenceInterval | None, dict[str, ConfidenceInterval | None]]:
@@ -243,23 +274,10 @@ def _calculate_bootstrap_ci(
             else:
                 cat_skips[lbl] += 1
 
-    def get_ci(vals: list[float], skips: int) -> ConfidenceInterval | None:
-        if not vals:
-            return None
-        vals.sort()
-        lower_idx = int(len(vals) * (alpha / 2.0))
-        upper_idx = min(int(len(vals) * (1.0 - (alpha / 2.0))), len(vals) - 1)
-
-        return ConfidenceInterval(
-            lower_bound=vals[lower_idx],
-            upper_bound=vals[upper_idx],
-            method="bootstrap",
-            alpha=alpha,
-            skipped_resamples=skips,
-        )
-
-    overall_ci = get_ci(overall_kappas, overall_skips)
-    per_cat_cis = {lbl: get_ci(cat_kappas[lbl], cat_skips[lbl]) for lbl in labels}
+    overall_ci = _percentile_ci(overall_kappas, overall_skips, alpha)
+    per_cat_cis = {
+        lbl: _percentile_ci(cat_kappas[lbl], cat_skips[lbl], alpha) for lbl in labels
+    }
 
     return overall_ci, per_cat_cis
 
