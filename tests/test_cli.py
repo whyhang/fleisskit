@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 
@@ -845,3 +846,424 @@ def test_cli_report_bad_actors_follow_outlier_threshold(capsys):
     assert all(
         a["sources"] == ["leave_one_out"] for a in strict if a["annotator_id"] in extra
     )
+
+
+# --- report-dispute ---
+
+
+def _dispute(out_dir: Path, *args: str) -> int:
+    """Runs report-dispute writing its files to out_dir (overwriting them)."""
+    return main(["report-dispute", *args, "--output-dir", str(out_dir), "--force"])
+
+
+def test_cli_report_dispute_text(tmp_path, capsys):
+    """report-dispute prints a summary, items per tag, each tag and reason, files."""
+    assert _dispute(tmp_path, str(SAMPLE_CSV)) == 0
+    captured = capsys.readouterr()
+    reason = "tie between 'negative', 'neutral', 'positive' (1 vote each)"
+    votes = "negative 1, neutral 1, positive 1"
+
+    assert captured.out.splitlines() == [
+        "Dispute Report for sample.csv",
+        "-----------------------------",
+        "Items: 50",
+        "Disputed Items: 3",
+        "Not Assessable (fewer than 2 votes): 0",
+        (
+            "Bad Actors: not used (add --use-bad-actors for BAD_ACTOR_FLIP and "
+            "BAD_ACTOR_NOISE)"
+        ),
+        "Weak Majority Cutoff: 2/3",
+        "Items per Tag (most severe first):",
+        "  Tag               | Items",
+        "  ------------------+------",
+        "  GOLD_KEY_CONFLICT |     0",
+        "  GOLD_MISMATCH     |     0",
+        "  TIE               |     3",
+        "  NO_MAJORITY       |     0",
+        "  WEAK_MAJORITY     |     0",
+        "  CONFIDENT_DISSENT |     0",
+        (
+            "  CONFIDENT_DISSENT needs 6+ votes, and 2+ annotators on one losing "
+            "label with confidence >= 0.8"
+        ),
+        "Disputed Items (most severe first):",
+        "  Item    | Tag | Votes                             | Reason",
+        "  --------+-----+-----------------------------------+-" + "-" * len(reason),
+        f"  item_33 | TIE | {votes} | {reason}",
+        f"  item_35 | TIE | {votes} | {reason}",
+        f"  item_7  | TIE | {votes} | {reason}",
+        "Review Files:",
+        f"  {tmp_path / 'agreed.csv'}: 141 annotations of 47 undisputed items",
+        f"  {tmp_path / 'disputed.csv'}: 9 annotations of 3 items to review",
+        (
+            f"  {tmp_path / 'to_review.csv'}: 3 rows, one per item to review "
+            "(3 disputed, 0 with too few votes)"
+        ),
+    ]
+    assert captured.err == ""
+
+
+def test_cli_report_dispute_writes_the_three_files(tmp_path, capsys):
+    """agreed.csv + disputed.csv are the input rows; to_review.csv lists items."""
+    out = tmp_path / "new" / "folder"  # created if missing
+    assert _dispute(out, str(SPAM_KNOWN_CSV), "--use-bad-actors") == 0
+    capsys.readouterr()
+
+    source = SPAM_KNOWN_CSV.read_bytes().splitlines(keepends=True)
+    agreed = (out / "agreed.csv").read_bytes().splitlines(keepends=True)
+    disputed = (out / "disputed.csv").read_bytes().splitlines(keepends=True)
+    assert agreed[0] == disputed[0] == source[0]  # the input's header
+    assert sorted(agreed[1:] + disputed[1:]) == sorted(source[1:])
+
+    with (out / "to_review.csv").open(encoding="utf-8", newline="") as f:
+        review = list(csv.DictReader(f))
+    assert len(review) == 63  # one row per disputed item
+    # item_0134 is GOLD_MISMATCH and WEAK_MAJORITY: only the worst is given.
+    assert review[0] == {
+        "Item ID": "item_0134",
+        "Severity": "2",
+        "Tag": "GOLD_MISMATCH",
+        "Reason": "gold is 'negative' (4 of 9 votes), votes favour 'neutral'",
+        "Label Counts": "neutral 5, negative 4",
+        "Winners": "neutral",
+        "Current Label": "neutral",
+        "Gold Labels": "negative",
+        "Decision": "",
+        "Reviewer": "",
+        "Notes": "",
+    }
+    disputed_ids = {row.split(b",")[0] for row in disputed[1:]}
+    assert disputed_ids == {r["Item ID"].encode() for r in review}
+
+
+def test_cli_report_dispute_defaults_to_the_current_folder(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    assert main(["report-dispute", str(SAMPLE_CSV)]) == 0
+    assert "  agreed.csv: 141 annotations of 47 undisputed items\n" in (
+        capsys.readouterr().out
+    )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "agreed.csv",
+        "disputed.csv",
+        "to_review.csv",
+    ]
+
+
+def test_cli_report_dispute_does_not_overwrite_without_force(tmp_path, capsys):
+    (tmp_path / "to_review.csv").write_text("keep me", encoding="utf-8")
+    args = ["report-dispute", str(SAMPLE_CSV), "--output-dir", str(tmp_path)]
+
+    assert main(args) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "to_review.csv (use --force to overwrite)" in captured.err
+    # Nothing was written, not even the files that didn't exist yet.
+    assert (tmp_path / "to_review.csv").read_text(encoding="utf-8") == "keep me"
+    assert not (tmp_path / "agreed.csv").exists()
+
+    assert main([*args, "--force"]) == 0
+    to_review = (tmp_path / "to_review.csv").read_text(encoding="utf-8")
+    assert to_review.startswith("Item ID")
+
+
+def test_cli_report_dispute_never_overwrites_its_input(tmp_path, capsys):
+    source = tmp_path / "disputed.csv"
+    source.write_bytes(SAMPLE_CSV.read_bytes())
+    assert _dispute(tmp_path, str(source)) == 1
+    assert "Refusing to overwrite the input file" in capsys.readouterr().err
+    assert source.read_bytes() == SAMPLE_CSV.read_bytes()
+
+
+def test_cli_report_dispute_unwritable_output(tmp_path, capsys):
+    blocker = tmp_path / "not_a_folder"
+    blocker.write_text("", encoding="utf-8")
+    assert _dispute(blocker, str(SAMPLE_CSV)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Error: Could not write the review files" in captured.err
+
+
+def test_cli_report_has_no_dispute_section(capsys):
+    """Disputes live in their own command; report is unchanged."""
+    assert main(["report", str(SPAM_KNOWN_CSV)]) == 0
+    assert "Disput" not in capsys.readouterr().out
+    assert main(["report", str(SPAM_KNOWN_CSV), "--format", "json"]) == 0
+    assert "disputes" not in json.loads(capsys.readouterr().out)
+    assert main(["report", str(SAMPLE_CSV), "--disputes"]) == 2
+
+
+def test_cli_report_dispute_does_not_use_bad_actors_by_default(tmp_path, capsys):
+    """Without --use-bad-actors the bad actor tags don't exist at all."""
+    assert _dispute(tmp_path, str(SPAM_KNOWN_CSV), "--format", "json") == 0
+    data = json.loads(capsys.readouterr().out)
+
+    assert data["used_bad_actors"] is False
+    assert data["bad_actor_ids"] == []
+    assert "BAD_ACTOR_FLIP" not in data["tag_order"]
+    assert "BAD_ACTOR_NOISE" not in data["tag_counts"]
+    assert all(
+        t["tag"] not in ("BAD_ACTOR_FLIP", "BAD_ACTOR_NOISE")
+        for item in data["disputes"]
+        for t in item["tags"]
+    )
+    assert data["disputed_items"] == 103
+    review = (tmp_path / "to_review.csv").read_text(encoding="utf-8")
+    assert "BAD_ACTOR" not in review
+
+
+def test_cli_report_dispute_use_bad_actors_text(tmp_path, capsys):
+    assert _dispute(tmp_path, str(SPAM_KNOWN_CSV), "--use-bad-actors") == 0
+    out = capsys.readouterr().out
+
+    assert "Disputed Items: 63\n" in out
+    assert (
+        "Bad Actors Left Out of the Votes: biased_clicker, constant_spammer, "
+        "random_clicker_fast\n"
+    ) in out
+    assert "  BAD_ACTOR_FLIP    |    14\n" in out
+    assert "  BAD_ACTOR_NOISE   |     4\n" in out
+    assert (
+        "  item_0001 | BAD_ACTOR_FLIP  | neutral 5, negative 4             | "
+        "'negative' with bad actors, 'neutral' without them\n"
+    ) in out
+    assert "Bad Actors (" not in out  # not the report command's table
+    assert (
+        f"  {tmp_path / 'disputed.csv'}: 756 annotations of 63 items to review\n" in out
+    )
+
+
+def test_cli_report_dispute_json(tmp_path, capsys):
+    args = [str(SPAM_KNOWN_CSV), "--format", "json", "--use-bad-actors"]
+    assert _dispute(tmp_path, *args) == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+
+    assert data["items"] == 150
+    assert data["disputed_items"] == 63
+    assert data["used_bad_actors"] is True
+    assert data["weak_majority_cutoff"] == pytest.approx(2 / 3)
+    assert data["weak_majority_cutoff_exact"] == "2/3"
+    assert data["tag_order"] == [
+        "GOLD_KEY_CONFLICT",
+        "GOLD_MISMATCH",
+        "TIE",
+        "BAD_ACTOR_FLIP",
+        "NO_MAJORITY",
+        "WEAK_MAJORITY",
+        "CONFIDENT_DISSENT",
+        "BAD_ACTOR_NOISE",
+    ]
+    assert data["not_assessable"] == []
+    assert data["disputes"][0] == {
+        "item_id": "item_0134",
+        "severity": 2,
+        "tags": [
+            {
+                "tag": "GOLD_MISMATCH",
+                "reason": "gold is 'negative' (4 of 9 votes), votes favour 'neutral'",
+            },
+            {
+                "tag": "WEAK_MAJORITY",
+                "reason": "'neutral' has 5 of 9 votes (56%), below 2/3",
+            },
+        ],
+        "votes": {"neutral": 5, "negative": 4},
+        "all_votes": {"neutral": 7, "negative": 4, "positive": 1},
+        "winners": ["neutral"],
+        "current_label": "neutral",
+        "gold_labels": ["negative"],
+    }
+    assert data["files"] == {
+        "agreed": {
+            "path": str(tmp_path / "agreed.csv"),
+            "annotations": 1044,
+            "items": 87,
+        },
+        "disputed": {
+            "path": str(tmp_path / "disputed.csv"),
+            "annotations": 756,
+            "items": 63,
+        },
+        "to_review": {
+            "path": str(tmp_path / "to_review.csv"),
+            "rows": 63,
+            "items": 63,
+            "disputed_items": 63,
+            "too_few_votes_items": 0,
+        },
+    }
+    assert captured.err == ""
+
+
+def test_cli_report_dispute_weak_majority_cutoff(tmp_path, capsys):
+    """The cutoff is exact: 0.67 flags 2-of-3 splits, the 2/3 default doesn't."""
+    args = [str(SAMPLE_CSV), "--format", "json"]
+    assert _dispute(tmp_path, *args) == 0
+    default = json.loads(capsys.readouterr().out)
+    assert _dispute(tmp_path, *args, "--weak-majority-cutoff", "0.67") == 0
+    literal = json.loads(capsys.readouterr().out)
+    assert _dispute(tmp_path, *args, "--weak-majority-cutoff", "2/3") == 0
+    fraction = json.loads(capsys.readouterr().out)
+
+    assert default["tag_counts"]["WEAK_MAJORITY"] == 0
+    assert fraction == default
+    assert literal["weak_majority_cutoff_exact"] == "67/100"
+    assert literal["tag_counts"]["WEAK_MAJORITY"] == 24  # every 2-1 split
+    assert literal["disputed_items"] == 27
+    assert literal["files"]["disputed"]["items"] == 27
+
+    assert _dispute(tmp_path, str(SAMPLE_CSV), "--weak-majority-cutoff", "3/4") == 0
+    assert "Weak Majority Cutoff: 3/4\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0.5", "1/2", "0", "1.5", "abc", "1/0", "-0.7"])
+def test_cli_report_dispute_rejects_bad_cutoff(value, tmp_path, capsys):
+    assert _dispute(tmp_path, str(SAMPLE_CSV), "--weak-majority-cutoff", value) == 2
+    assert "--weak-majority-cutoff" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cli_report_dispute_bad_actors_follow_outlier_threshold(tmp_path, capsys):
+    args = [str(OUTLIERS_CSV), "--format", "json", "--use-bad-actors"]
+    assert _dispute(tmp_path, *args) == 0
+    default = json.loads(capsys.readouterr().out)
+    assert _dispute(tmp_path, *args, "--outlier-threshold", "0.1") == 0
+    strict = json.loads(capsys.readouterr().out)
+
+    assert default["bad_actor_ids"] == ["random_clicker", "spammer"]
+    assert default["tag_counts"]["BAD_ACTOR_NOISE"] == 32
+    assert strict["bad_actor_ids"] == ["good_1", "good_8", "random_clicker", "spammer"]
+
+
+def test_cli_report_dispute_missing_file(tmp_path, capsys):
+    assert _dispute(tmp_path, "does_not_exist_file.csv") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Error: File not found" in captured.err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cli_report_dispute_broken_file(tmp_path, capsys):
+    csv_file = tmp_path / "broken.csv"
+    csv_file.write_text(
+        "item_id,annotator_id,is_gold,label\n1,A,true,yes\n", encoding="utf-8"
+    )
+    assert _dispute(tmp_path / "out", str(csv_file)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Data error" in captured.err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_report_dispute_json_input(tmp_path, capsys):
+    """JSON input: the two annotation files are CSV with the JSON keys as columns."""
+    json_file = tmp_path / "data.json"
+    json_file.write_text(
+        json.dumps(
+            [
+                {"item_id": "i1", "annotator_id": "a", "is_gold": False, "label": "x"},
+                {"item_id": "i1", "annotator_id": "b", "is_gold": False, "label": "y"},
+                {"item_id": "i2", "annotator_id": "a", "is_gold": False, "label": "x"},
+                {"item_id": "i2", "annotator_id": "b", "is_gold": False, "label": "x"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    assert _dispute(out, str(json_file), "--format", "json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [item["item_id"] for item in data["disputes"]] == ["i1"]
+    assert data["disputes"][0]["tags"][0]["tag"] == "TIE"
+
+    assert (out / "disputed.csv").read_text(encoding="utf-8").splitlines() == [
+        "item_id,annotator_id,is_gold,label",
+        "i1,a,false,x",
+        "i1,b,false,y",
+    ]
+    assert (out / "agreed.csv").read_text(encoding="utf-8").splitlines() == [
+        "item_id,annotator_id,is_gold,label",
+        "i2,a,false,x",
+        "i2,b,false,x",
+    ]
+
+
+def test_cli_report_dispute_nothing_to_review(tmp_path, capsys):
+    csv_file = tmp_path / "agree.csv"
+    csv_file.write_text(
+        "item_id,annotator_id,is_gold,label\n"
+        "item_1,user_1,false,yes\n"
+        "item_1,user_2,false,yes\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    assert _dispute(out, str(csv_file)) == 0
+    text = capsys.readouterr().out
+    assert "Disputed Items: None\n" in text
+    assert f"  {out / 'disputed.csv'}: 0 annotations of 0 items to review\n" in text
+    assert (
+        f"  {out / 'to_review.csv'}: 0 rows, one per item to review "
+        "(0 disputed, 0 with too few votes)\n"
+    ) in text
+
+    # Header-only files, so the reviewer still gets all three.
+    assert (out / "disputed.csv").read_bytes() == (
+        b"item_id,annotator_id,is_gold,label\r\n"
+    )
+    assert (out / "to_review.csv").read_bytes() == (
+        b"Item ID,Severity,Tag,Reason,Label Counts,Winners,Current Label,"
+        b"Gold Labels,Decision,Reviewer,Notes\r\n"
+    )
+
+
+def test_cli_report_dispute_sends_too_few_votes_to_review(tmp_path, capsys):
+    csv_file = tmp_path / "few.csv"
+    csv_file.write_text(
+        "item_id,annotator_id,is_gold,label\n"
+        "item_1,user_1,false,yes\n"
+        "item_1,user_2,false,yes\n"
+        "item_2,user_1,false,no\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    assert _dispute(out, str(csv_file)) == 0
+    text = capsys.readouterr().out
+    assert "Disputed Items: 0\n" in text
+    assert "Not Assessable (fewer than 2 votes): 1\n" in text
+    assert "Not Assessable Items: item_2\n" in text
+    assert f"  {out / 'agreed.csv'}: 2 annotations of 1 undisputed items\n" in text
+    assert f"  {out / 'disputed.csv'}: 1 annotations of 1 items to review\n" in text
+    assert (
+        f"  {out / 'to_review.csv'}: 1 rows, one per item to review "
+        "(0 disputed, 1 with too few votes)\n"
+    ) in text
+
+    assert (out / "disputed.csv").read_bytes() == (
+        b"item_id,annotator_id,is_gold,label\r\nitem_2,user_1,false,no\r\n"
+    )
+    assert (out / "to_review.csv").read_bytes().splitlines()[1] == (
+        b"item_2,9,TOO_FEW_VOTES,only 1 vote; at least 2 are needed to check "
+        b"for a dispute,no 1,no,no,,,,"
+    )
+
+    assert _dispute(out, str(csv_file), "--format", "json") == 0
+    files = json.loads(capsys.readouterr().out)["files"]
+    assert files["to_review"]["too_few_votes_items"] == 1
+    assert files["to_review"]["disputed_items"] == 0
+
+
+def test_cli_report_dispute_lists_at_most_ten_not_assessable_items(tmp_path, capsys):
+    rows = "".join(f"item_{k:02d},user_1,false,yes\n" for k in range(12))
+    csv_file = tmp_path / "single.csv"
+    csv_file.write_text("item_id,annotator_id,is_gold,label\n" + rows, encoding="utf-8")
+    out = tmp_path / "out"
+    assert _dispute(out, str(csv_file)) == 0
+    assert (
+        "Not Assessable Items: item_00, item_01, item_02, item_03, item_04, "
+        "item_05, item_06, item_07, item_08, item_09 and 2 more\n"
+    ) in capsys.readouterr().out
+
+    assert _dispute(out, str(csv_file), "--format", "json") == 0
+    assert len(json.loads(capsys.readouterr().out)["not_assessable"]) == 12

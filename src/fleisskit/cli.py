@@ -2,10 +2,23 @@ import argparse
 import json
 import sys
 from collections import Counter
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from fleisskit.bad_actors import BadActor, exclude_annotators, find_bad_actors
+from fleisskit.disputes import (
+    BAD_ACTOR_TAGS,
+    CONFIDENT_DISSENT_MIN_CONFIDENCE,
+    CONFIDENT_DISSENT_MIN_DISSENTERS,
+    CONFIDENT_DISSENT_MIN_VOTES,
+    DEFAULT_WEAK_MAJORITY_CUTOFF,
+    MIN_VOTES,
+    DisputeReport,
+    find_disputes,
+    format_fraction,
+    format_votes,
+)
 from fleisskit.fleiss import fleiss_kappa, per_category_kappa
 from fleisskit.generator import generate_synthetic_data
 from fleisskit.influence import (
@@ -13,8 +26,13 @@ from fleisskit.influence import (
     LeaveOneOutReport,
     leave_one_annotator_out,
 )
-from fleisskit.io import DataValidationError, load_csv, load_json
+from fleisskit.io import DataValidationError, load_csv, load_json, load_with_rows
 from fleisskit.metrics import majority_vote, percent_agreement
+from fleisskit.review_files import (
+    ReviewFiles,
+    ReviewFilesExistError,
+    write_review_files,
+)
 from fleisskit.spam import DEFAULT_PARAMS, SpamVerdict, detect_spammers
 
 
@@ -554,6 +572,219 @@ def run_report(
     return 0
 
 
+# How many not-assessable item ids the text dispute report lists.
+_MAX_LISTED_ITEMS = 10
+
+
+def _format_dispute_report(report: DisputeReport, file_name: str) -> list[str]:
+    """
+    The report-dispute text output: a summary, the number of items per tag,
+    then one row per (item, tag) with the reason, most severe item first.
+
+    An item with several tags gets one row per tag, with the item id and votes
+    repeated, so every row stands alone (like the bad actors table). Votes are
+    the ones the rules used: without bad actors when they were left out.
+    """
+    title = f"Dispute Report for {file_name}"
+    lines = [title, "-" * len(title)]
+    lines.append(f"Items: {report.items_checked}")
+    lines.append(f"Disputed Items: {len(report.items)}")
+    lines.append(
+        f"Not Assessable (fewer than {MIN_VOTES} votes): {len(report.not_assessable)}"
+    )
+    if report.used_bad_actors:
+        names = ", ".join(report.bad_actor_ids) or "none found"
+        lines.append(f"Bad Actors Left Out of the Votes: {names}")
+    else:
+        tags = " and ".join(sorted(BAD_ACTOR_TAGS))
+        lines.append(f"Bad Actors: not used (add --use-bad-actors for {tags})")
+    lines.append(
+        f"Weak Majority Cutoff: {format_fraction(report.weak_majority_cutoff)}"
+    )
+
+    tag_w = max(len("Tag"), *(len(tag) for tag in report.tag_counts))
+    count_w = max(len("Items"), *(len(str(n)) for n in report.tag_counts.values()))
+    lines.append("Items per Tag (most severe first):")
+    lines.append(f"  {'Tag':<{tag_w}} | {'Items':>{count_w}}")
+    lines.append(f"  {'-' * tag_w}-+-{'-' * count_w}")
+    lines += [
+        f"  {tag:<{tag_w}} | {n:>{count_w}}" for tag, n in report.tag_counts.items()
+    ]
+    lines.append(
+        f"  CONFIDENT_DISSENT needs {CONFIDENT_DISSENT_MIN_VOTES}+ votes, and "
+        f"{CONFIDENT_DISSENT_MIN_DISSENTERS}+ annotators on one losing label with "
+        f"confidence >= {CONFIDENT_DISSENT_MIN_CONFIDENCE:g}"
+    )
+
+    if report.items:
+        lines.append("Disputed Items (most severe first):")
+        rows = [
+            (item.item_id, tag, format_votes(item.votes), reason)
+            for item in report.items
+            for tag, reason in zip(item.tags, item.reasons, strict=True)
+        ]
+        header = ("Item", "Tag", "Votes", "Reason")
+        widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(header)]
+
+        def fmt(cells: tuple[str, ...]) -> str:
+            parts = [f"{c:<{w}}" for c, w in zip(cells, widths, strict=True)]
+            return ("  " + " | ".join(parts)).rstrip()
+
+        lines += [fmt(header), "  " + "-+-".join("-" * w for w in widths)]
+        lines += [fmt(r) for r in rows]
+    else:
+        lines.append("Disputed Items: None")
+
+    if report.not_assessable:
+        shown = ", ".join(report.not_assessable[:_MAX_LISTED_ITEMS])
+        more = len(report.not_assessable) - _MAX_LISTED_ITEMS
+        if more > 0:
+            shown += f" and {more} more"
+        lines.append(f"Not Assessable Items: {shown}")
+    return lines
+
+
+def _format_review_files(files: ReviewFiles) -> list[str]:
+    """Where report-dispute wrote the reviewer's files, and what is in them."""
+    agreed, disputed, to_review = files.agreed, files.disputed, files.to_review
+    return [
+        "Review Files:",
+        f"  {agreed.path}: {agreed.rows} annotations of {agreed.items} "
+        + "undisputed items",
+        f"  {disputed.path}: {disputed.rows} annotations of {disputed.items} "
+        + "items to review",
+        f"  {to_review.path}: {to_review.rows} rows, one per item to review "
+        + f"({files.disputed_items} disputed, {files.too_few_votes_items} with "
+        + "too few votes)",
+    ]
+
+
+def _review_files_to_json(files: ReviewFiles) -> dict[str, Any]:
+    return {
+        "agreed": {
+            "path": str(files.agreed.path),
+            "annotations": files.agreed.rows,
+            "items": files.agreed.items,
+        },
+        "disputed": {
+            "path": str(files.disputed.path),
+            "annotations": files.disputed.rows,
+            "items": files.disputed.items,
+        },
+        "to_review": {
+            "path": str(files.to_review.path),
+            "rows": files.to_review.rows,
+            "items": files.to_review.items,
+            "disputed_items": files.disputed_items,
+            "too_few_votes_items": files.too_few_votes_items,
+        },
+    }
+
+
+def _dispute_report_to_json(report: DisputeReport) -> dict[str, Any]:
+    """JSON-ready dict for report-dispute."""
+    return {
+        "items": report.items_checked,
+        "disputed_items": len(report.items),
+        "weak_majority_cutoff": float(report.weak_majority_cutoff),
+        "weak_majority_cutoff_exact": str(report.weak_majority_cutoff),
+        "used_bad_actors": report.used_bad_actors,
+        "bad_actor_ids": list(report.bad_actor_ids),
+        # The tags this run could produce, most severe first.
+        "tag_order": list(report.tag_counts),
+        "tag_counts": report.tag_counts,
+        "not_assessable": list(report.not_assessable),
+        "disputes": [
+            {
+                "item_id": item.item_id,
+                "severity": item.severity,
+                "tags": [
+                    {"tag": tag, "reason": reason}
+                    for tag, reason in zip(item.tags, item.reasons, strict=True)
+                ],
+                "votes": item.votes,
+                "all_votes": item.all_votes,
+                "winners": list(item.winners),
+                "current_label": item.current_label,
+                "gold_labels": list(item.gold_labels),
+            }
+            for item in report.items
+        ],
+    }
+
+
+def run_report_dispute(
+    file_path: Path,
+    output_format: str,
+    use_bad_actors: bool = False,
+    weak_majority_cutoff: Fraction = DEFAULT_WEAK_MAJORITY_CUTOFF,
+    outlier_threshold: float = _DEFAULT_OUTLIER_THRESHOLD,
+    output_dir: Path = Path("."),
+    force: bool = False,
+) -> int:
+    """
+    report-dispute command logic: prints the dispute report and writes
+    agreed.csv, disputed.csv and to_review.csv into output_dir.
+    """
+    try:
+        if not file_path.exists():
+            print(f"Error: File not found: {file_path}", file=sys.stderr)
+            return 1
+
+        # The raw rows too, so agreed.csv / disputed.csv keep them unchanged.
+        collection, source = load_with_rows(file_path)
+
+        # Opt-in: bad actors are found on the whole dataset, then their
+        # labels are left out of the votes.
+        bad_actor_ids = None
+        if use_bad_actors:
+            bad_actor_ids = {
+                bad.annotator_id
+                for bad in find_bad_actors(
+                    collection, outlier_threshold=outlier_threshold
+                )
+            }
+
+        report = find_disputes(
+            collection,
+            weak_majority_cutoff=weak_majority_cutoff,
+            bad_actor_ids=bad_actor_ids,
+        )
+
+        # Files first: if they can't be written, nothing is printed to stdout.
+        try:
+            files = write_review_files(
+                collection,
+                source,
+                report,
+                output_dir,
+                force=force,
+                input_path=file_path,
+            )
+        except (ReviewFilesExistError, ValueError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        except OSError as e:
+            print(f"Error: Could not write the review files: {e}", file=sys.stderr)
+            return 1
+
+        if output_format == "json":
+            output = _dispute_report_to_json(report)
+            output["files"] = _review_files_to_json(files)
+            print(json.dumps(output, indent=2))
+        else:
+            for line in _format_dispute_report(report, file_path.name):
+                print(line)
+            for line in _format_review_files(files):
+                print(line)
+
+    except (DataValidationError, ValueError, TypeError) as e:
+        print(f"Data error:\n{e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
 def _positive_int(value: str) -> int:
     """argparse type: a whole number >= 1."""
     try:
@@ -602,6 +833,21 @@ def _fraction(value: str) -> float:
     if not 0.0 <= number <= 1.0:
         raise argparse.ArgumentTypeError(f"must be between 0 and 1, got {value}")
     return number
+
+
+def _weak_majority_cutoff(value: str) -> Fraction:
+    """argparse type: an exact fraction above 1/2 and at most 1 ("2/3", "0.75")."""
+    try:
+        cutoff = Fraction(value.strip())
+    except (ValueError, ZeroDivisionError):
+        raise argparse.ArgumentTypeError(
+            f"expected a number or fraction such as 0.75 or 2/3, got '{value}'"
+        )
+    if not Fraction(1, 2) < cutoff <= 1:
+        raise argparse.ArgumentTypeError(
+            f"must be above 1/2 and at most 1, got {value}"
+        )
+    return cutoff
 
 
 def _label_list(value: str) -> list[str]:
@@ -739,6 +985,55 @@ def main(args: list[str] | None = None) -> int:
         f"(default: {_DEFAULT_OUTLIER_THRESHOLD:g})",
     )
 
+    # Report-dispute Subcommand
+    dispute_parser = subparsers.add_parser(
+        "report-dispute",
+        help="List disputed items, with a tag and reason for each dispute",
+    )
+    dispute_parser.add_argument("file", type=Path, help="Path to the CSV or JSON file")
+    dispute_parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)",
+    )
+    dispute_parser.add_argument(
+        "--use-bad-actors",
+        action="store_true",
+        help="Leave the labels of annotators flagged by the spam check or as "
+        "leave-one-out outliers out of the votes, and add the BAD_ACTOR_FLIP "
+        "and BAD_ACTOR_NOISE tags (default: off, every annotator counts)",
+    )
+    dispute_parser.add_argument(
+        "--weak-majority-cutoff",
+        type=_weak_majority_cutoff,
+        default=DEFAULT_WEAK_MAJORITY_CUTOFF,
+        help="Tag WEAK_MAJORITY when the winner's share of the votes is below "
+        "this: a fraction (2/3) or decimal, taken exactly, above 1/2 and at "
+        "most 1 (default: 2/3, about 0.67)",
+    )
+    dispute_parser.add_argument(
+        "--outlier-threshold",
+        type=_positive_float,
+        default=_DEFAULT_OUTLIER_THRESHOLD,
+        help="With --use-bad-actors: score above which an annotator is a "
+        f"leave-one-out outlier (default: {_DEFAULT_OUTLIER_THRESHOLD:g})",
+    )
+    dispute_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("."),
+        help="Folder for to_review.csv (one row per disputed item or item with "
+        "too few votes, with empty Decision, Reviewer and Notes columns), "
+        "disputed.csv (the rows of those items) and agreed.csv (all other "
+        "rows); created if missing (default: the current folder)",
+    )
+    dispute_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite agreed.csv, disputed.csv and to_review.csv if they exist",
+    )
+
     # Generate Subcommand
     generate_parser = subparsers.add_parser(
         "generate", help="Generate a synthetic annotation file (CSV or JSON)"
@@ -807,6 +1102,17 @@ def main(args: list[str] | None = None) -> int:
             parsed_args.spam_base_rate,
             parsed_args.list_bad_actors,
             parsed_args.exclude_bad_actors,
+        )
+
+    if parsed_args.command == "report-dispute":
+        return run_report_dispute(
+            parsed_args.file,
+            parsed_args.format,
+            use_bad_actors=parsed_args.use_bad_actors,
+            weak_majority_cutoff=parsed_args.weak_majority_cutoff,
+            outlier_threshold=parsed_args.outlier_threshold,
+            output_dir=parsed_args.output_dir,
+            force=parsed_args.force,
         )
 
     if parsed_args.command == "generate":

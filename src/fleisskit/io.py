@@ -1,5 +1,6 @@
 import csv
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -98,25 +99,34 @@ def _check_headers(headers: list[str]):
         raise ValueError(f"Missing required columns in header: {', '.join(missing)}")
 
 
-def load_csv(file_path: str | Path) -> AnnotationCollection:
-    """Loads annotations from a CSV file."""
-    path = Path(file_path)
+@dataclass(frozen=True)
+class SourceRows:
+    """
+    The input file as it was read, before any type conversion.
 
+    rows[i] is the row that collection.annotations[i] was built from, so the
+    rows can be written back out unchanged (see fleisskit.review_files).
+    """
+
+    # Column names in file order: the CSV header, or for JSON every key in the
+    # order it first appears.
+    columns: tuple[str, ...]
+    rows: tuple[dict[str, Any], ...]
+
+
+def _read_csv(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    """The header and raw rows of a CSV file, after the header check."""
     with path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
             raise ValueError("CSV file is empty or missing headers.")
 
         _check_headers(list(reader.fieldnames))
-
-        # start=2 because row 1 is the header
-        return _process_rows(list(reader), start_row=2)
+        return list(reader.fieldnames), list(reader)
 
 
-def load_json(file_path: str | Path) -> AnnotationCollection:
-    """Loads annotations from a JSON file (list of objects)."""
-    path = Path(file_path)
-
+def _read_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    """The keys and raw objects of a JSON file, after the header check."""
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -126,5 +136,43 @@ def load_json(file_path: str | Path) -> AnnotationCollection:
     if len(data) > 0:
         _check_headers(list(data[0].keys()))
 
+    # Objects may have different keys: keep every key, in first-seen order.
+    columns = list(
+        dict.fromkeys(k for obj in data if isinstance(obj, dict) for k in obj)
+    )
+    return columns, data
+
+
+def load_csv(file_path: str | Path) -> AnnotationCollection:
+    """Loads annotations from a CSV file."""
+    _, rows = _read_csv(Path(file_path))
+    # start=2 because row 1 is the header
+    return _process_rows(rows, start_row=2)
+
+
+def load_json(file_path: str | Path) -> AnnotationCollection:
+    """Loads annotations from a JSON file (list of objects)."""
+    _, rows = _read_json(Path(file_path))
     # start=1 , 0 is headers
-    return _process_rows(data, start_row=1)
+    return _process_rows(rows, start_row=1)
+
+
+def load_with_rows(
+    file_path: str | Path,
+) -> tuple[AnnotationCollection, SourceRows]:
+    """
+    Loads a CSV or JSON file (by extension, like the CLI: .json is JSON,
+    anything else CSV) and also returns its raw rows, one per annotation in
+    the same order. Validation is the same as load_csv / load_json.
+    """
+    path = Path(file_path)
+    if path.suffix.lower() == ".json":
+        columns, rows = _read_json(path)
+        collection = _process_rows(rows, start_row=1)
+    else:
+        columns, rows = _read_csv(path)
+        collection = _process_rows(rows, start_row=2)
+    # _process_rows raises on any bad row, so there is exactly one annotation
+    # per row, in row order.
+    assert len(collection.annotations) == len(rows)
+    return collection, SourceRows(columns=tuple(columns), rows=tuple(rows))

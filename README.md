@@ -154,6 +154,109 @@ A bad actor is an annotator flagged by **either** the spam check or the leave-on
 - **`--spam-base-rate` flows into the quoted confidence.** At 2%, `random_clicker` reads `49% confident`: still flagged, but more likely honest than not.
 - **JSON:** `bad_actors` holds `excluded`, `fleiss_kappa_with_bad_actors` (set when they were excluded), and per annotator `sources`, `reasons`, `spam_confidence_percent`, `outlier_score` and `kappa_delta`.
 
+## Disputed items
+
+`report-dispute` lists the items whose labels conflict. Each item is tagged with every reason that applies, and each tag comes with a reason line. An item's severity is its worst tag. It also writes three files for a reviewer (see [Files for the reviewer](#files-for-the-reviewer)):
+
+    uv run fleisskit report-dispute tests/data/spam_known.csv --use-bad-actors --output-dir review/
+
+    Dispute Report for spam_known.csv
+    ---------------------------------
+    Items: 150
+    Disputed Items: 63
+    Not Assessable (fewer than 2 votes): 0
+    Bad Actors Left Out of the Votes: biased_clicker, constant_spammer, random_clicker_fast
+    Weak Majority Cutoff: 2/3
+    Items per Tag (most severe first):
+      Tag               | Items
+      ------------------+------
+      GOLD_KEY_CONFLICT |     0
+      GOLD_MISMATCH     |     1
+      TIE               |     3
+      BAD_ACTOR_FLIP    |    14
+      NO_MAJORITY       |    18
+      WEAK_MAJORITY     |    38
+      CONFIDENT_DISSENT |     0
+      BAD_ACTOR_NOISE   |     4
+      CONFIDENT_DISSENT needs 6+ votes, and 2+ annotators on one losing label with confidence >= 0.8
+    Disputed Items (most severe first):
+      Item      | Tag             | Votes                             | Reason
+      ----------+-----------------+-----------------------------------+---------------------------------------------------------
+      item_0134 | GOLD_MISMATCH   | neutral 5, negative 4             | gold is 'negative' (4 of 9 votes), votes favour 'neutral'
+      item_0134 | WEAK_MAJORITY   | neutral 5, negative 4             | 'neutral' has 5 of 9 votes (56%), below 2/3
+      item_0017 | TIE             | negative 4, neutral 4, positive 1 | tie between 'negative', 'neutral' (4 votes each)
+      item_0001 | BAD_ACTOR_FLIP  | neutral 5, negative 4             | 'negative' with bad actors, 'neutral' without them
+      ...
+    Review Files:
+      review/agreed.csv: 1044 annotations of 87 undisputed items
+      review/disputed.csv: 756 annotations of 63 items to review
+      review/to_review.csv: 63 rows, one per item to review (63 disputed, 0 with too few votes)
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--format` | `text` | `text` or `json` |
+| `--use-bad-actors` | off | leave bad actors' labels out of the votes, and add `BAD_ACTOR_FLIP` and `BAD_ACTOR_NOISE` |
+| `--weak-majority-cutoff` | 2/3 | the share of the votes below which a majority is weak |
+| `--outlier-threshold` | 3.5 | with `--use-bad-actors`: the bar for a leave-one-out outlier, as in `report` |
+| `--output-dir` | current folder | where the three files go; created if missing |
+| `--force` | off | overwrite the three files if they exist |
+
+**Votes** are how many annotators gave each label to an item. The **winners** are the label(s) with the most votes. Blank labels don't count.
+
+| # | Tag | Fires when |
+|---|---|---|
+| 1 | `GOLD_KEY_CONFLICT` | the item's rows disagree on the gold answer: different `gold_label`s, or `is_gold` on some rows only |
+| 2 | `GOLD_MISMATCH` | a gold item whose gold label is not a winner |
+| 3 | `TIE` | two or more labels share the most votes, so the majority vote comes down to alphabetical order |
+| 4 | `BAD_ACTOR_FLIP` | the majority vote with bad actors is not a winner without them |
+| 5 | `NO_MAJORITY` | one winner, with half the votes or fewer (e.g. 2-1-1) |
+| 6 | `WEAK_MAJORITY` | one winner, with over half the votes but under the cutoff (e.g. 5-3 at the default 2/3) |
+| 7 | `CONFIDENT_DISSENT` | on an item with 6+ votes, 2+ annotators chose the same losing label with `confidence` >= 0.8 |
+| 8 | `BAD_ACTOR_NOISE` | the votes are unanimous without bad actors, but not with them |
+
+- **Bad actors are opt-in.** By default everyone's votes count, and tags 4 and 8 don't appear at all. `--use-bad-actors` finds bad actors on the whole dataset, exactly as `report --list-bad-actors` does, and leaves their labels out of the votes.
+- **The cutoff is exact.** The default is 2/3, so a 2-1 split among 3 annotators is not weak. The option takes a fraction (`3/4`) or a decimal, above 1/2 and at most 1. A decimal is taken as written: `0.67` is just above 2/3, so it makes every 2-1 split weak (24 more items on `sample.csv`).
+- **Why `CONFIDENT_DISSENT` needs 6 votes.** Two dissenters can only share a losing label if the winner has at least 3 votes, so the rule can't fire below 5. At 5, the only such split is 3-2, which is already `WEAK_MAJORITY`. At 6, it catches 4-2, which the vote counts alone pass.
+- **Items with fewer than 2 votes** can't be judged, so they are counted as "not assessable", and the first 10 are listed. Only `GOLD_KEY_CONFLICT` is still checked on them. They are not disputes, but they still go to the reviewer (see below).
+- **Deterministic.** Vote shares are compared as whole numbers and exact fractions. Nothing is random, and the order of rows in the file doesn't matter. Items are sorted by severity, then by number of tags (most first), then by id. An item with several tags gets one row per tag.
+- **JSON:** `items`, `disputed_items`, the cutoff (`weak_majority_cutoff`, `weak_majority_cutoff_exact`), `used_bad_actors`, `bad_actor_ids`, `tag_order`, `tag_counts`, `not_assessable` (every id), `disputes` and `files`. Each entry in `disputes` has `item_id`, `severity` (1 = most severe), `tags` (a list of `{"tag", "reason"}`), `votes` (what the rules used), `all_votes`, `winners`, `current_label` (what the majority vote gives today) and `gold_labels`. `files` gives the `path` and counts of each file written.
+
+### Files for the reviewer
+
+| File | Contents |
+|---|---|
+| `to_review.csv` | one row per item to review, for the reviewer to fill in (see below): every disputed item, most severe first, then every item with too few votes |
+| `disputed.csv` | the input rows of every item in `to_review.csv`: all of its rows, including bad actors' and blank labels |
+| `agreed.csv` | the input rows of every other item |
+
+`to_review.csv` columns:
+
+| Column | Contents |
+|---|---|
+| `Item ID` | the item |
+| `Severity` | position of `Tag` in the tag table above (1 = most severe); 9 for `TOO_FEW_VOTES` |
+| `Tag`, `Reason` | the item's most severe tag and its reason. The stdout report and the JSON list every tag |
+| `Label Counts` | each label's count in one cell, most votes first: `neutral 5, negative 4` (`-` if none). These are the votes the rules used, so with `--use-bad-actors` they leave out bad actors and match the numbers in `Reason` |
+| `Winners` | the label(s) with the most votes |
+| `Current Label` | what the majority vote gives today |
+| `Gold Labels` | the gold answer, for gold items |
+| `Decision`, `Reviewer`, `Notes` | empty, for the reviewer |
+
+Example rows (`spam_known.csv` with `--use-bad-actors`, plus an item with one vote):
+
+    Item ID,Severity,Tag,Reason,Label Counts,Winners,Current Label,Gold Labels,Decision,Reviewer,Notes
+    item_0134,2,GOLD_MISMATCH,"gold is 'negative' (4 of 9 votes), votes favour 'neutral'","neutral 5, negative 4",neutral,neutral,negative,,,
+    item_0017,3,TIE,"tie between 'negative', 'neutral' (4 votes each)","negative 4, neutral 4, positive 1","negative, neutral",neutral,,,,
+    item_2,9,TOO_FEW_VOTES,only 1 vote; at least 2 are needed to check for a dispute,no 1,no,no,,,,
+
+- **Items with too few votes** (fewer than 2, after leaving out bad actors if they were) get the tag `TOO_FEW_VOTES` and severity 9, after every dispute tag. The reason says how many votes there were, e.g. `no votes`, `only 1 vote`, or `only 1 vote without bad actors (3 with them)`. An item that also has a `GOLD_KEY_CONFLICT` is listed once, under that tag.
+
+- **Together, `agreed.csv` and `disputed.csv` are the input.** Every input row goes to exactly one of them, based on its item, and keeps its original order. Both have the input's columns in the input's order, and each row is written exactly as it was read: extra whitespace, `TRUE`/`false` spelling and number formatting are all kept. The tests check that interleaving the two files rebuilds each fixture byte for byte.
+- **Byte for byte needs the csv module's style:** minimal quoting and CRLF line endings, like the fixtures. Other CSV files come back with the same values, but quoting and line endings may change.
+- **JSON input gives CSV files** whose columns are the JSON keys, in the order they first appear. `null` becomes an empty cell, `true`/`false` become `true`/`false`, and numbers are written as they are. The files load back to the same annotations.
+- **`agreed.csv` has only items that need no review:** every item in `to_review.csv`, including items with too few votes, has its rows in `disputed.csv`.
+- **Nothing is overwritten by accident.** If any of the three files exists, the command writes nothing and exits 1, unless `--force` is given. It never overwrites its own input file, even with `--force`. The files are written before anything is printed.
+
 ## Python API
 
     from fleisskit.io import load_csv
@@ -165,6 +268,17 @@ A bad actor is an annotator flagged by **either** the spam check or the leave-on
     collection = load_csv("data.csv")
     bad = find_bad_actors(collection, base_rate=0.05)
     clean = exclude_annotators(collection, {b.annotator_id for b in bad})
+
+    from fleisskit.disputes import find_disputes
+    disputes = find_disputes(collection)                                       # everyone's votes
+    disputes = find_disputes(collection, bad_actor_ids={b.annotator_id for b in bad})
+    for item in disputes.items:
+        print(item.item_id, list(zip(item.tags, item.reasons)))
+
+    from fleisskit.io import load_with_rows                                   # keeps the raw rows
+    from fleisskit.review_files import write_review_files
+    collection, source = load_with_rows("data.csv")
+    write_review_files(collection, source, find_disputes(collection), "review/")
 
 If you know some annotators' roles, you can tune and calibrate the spam check on them:
 
@@ -209,6 +323,7 @@ Test fixtures:
 - **Slow random clickers are the spam check's blind spot.** Without much gold, they look like weak but honest annotators (`random_clicker_slow` above scores 0.43, unflagged). Gold items fix this. Gold gets only weight 0.1 because most simulated annotators have little gold, so re-tune if you have plenty.
 - **The tuning and confidence come from simulated annotators.** A 98% means "98% in a world like the simulation", and spam strategies it doesn't model (e.g. copying a neighbour) may go uncaught.
 - **A flag is a prompt to review someone's work, not proof.**
+- **Disputes measure disagreement, not correctness.** An item everyone gets wrong in the same way is not disputed. `CONFIDENT_DISSENT` needs the `confidence` column, and relies on each annotator's own idea of what 0.8 confidence means.
 
 ## Running tests
 
